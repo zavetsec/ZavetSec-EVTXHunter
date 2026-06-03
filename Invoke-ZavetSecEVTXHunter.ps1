@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    ZavetSec-EVTXHunter v1.0 - Advanced Windows Event Log Threat Hunter
+    ZavetSec-EVTXHunter v1.1.0 - Advanced Windows Event Log Threat Hunter
 
 .DESCRIPTION
     Threat hunting and DFIR analysis tool for Windows Event Logs (EVTX).
@@ -50,8 +50,19 @@
 .PARAMETER TimeRangeHours
     Process only events from the last N hours. 0 = all events. Default: 0
 
+.PARAMETER WorkHoursTimeZoneOffset
+    UTC offset (in hours) of the MONITORED environment, used to interpret
+    business hours during temporal off-hours analysis. Default: 0 (UTC).
+    Example: for a host in UTC+5 (e.g. Almaty), pass 5 so that 09:00-18:00
+    local is evaluated correctly regardless of the analyst workstation's
+    own time zone. Display timestamps elsewhere are unaffected.
+
 .PARAMETER Whitelist
     Path to JSON whitelist file with conditions to suppress false positives.
+    Expected shape (array of objects):
+      [ { "RuleID": "ZVS-PE-001", "Fields": { "ImagePath": "*\\MyApp\\*" } } ]
+    RuleID is optional (omit to apply to all rules). Fields is required and
+    must contain at least one field/wildcard pair.
 
 .EXAMPLE
     .\Invoke-ZavetSecEVTXHunter.ps1 -Path C:\Forensics\Security.evtx
@@ -71,7 +82,7 @@
 
 .NOTES
     Author  : ZavetSec Research
-    Version : 1.0.0
+    Version : 1.1.0
     Tags    : DFIR, Threat Hunting, EVTX, Sigma, Windows Event Logs
     License : MIT
 #>
@@ -109,6 +120,9 @@ param(
     [ValidateRange(1,23)]
     [int]$WorkHoursEnd = 18,
 
+    [ValidateRange(-14,14)]
+    [int]$WorkHoursTimeZoneOffset = 0,
+
     [ValidateRange(0,[int]::MaxValue)]
     [int]$MaxEvents = 1000000,
 
@@ -121,6 +135,14 @@ param(
 Set-StrictMode -Version 1.0
 $ErrorActionPreference = 'SilentlyContinue'
 
+# Force InvariantCulture so all numeric -> string conversions use '.' as the
+# decimal separator. Without this, on locales like ru-RU (comma separator) the
+# entity scores embedded into the report JSON serialize as e.g. "score":33,3 -
+# invalid JSON that breaks JSON.parse and the interactive report. Date output
+# uses explicit format strings and is unaffected.
+[System.Threading.Thread]::CurrentThread.CurrentCulture =
+    [System.Globalization.CultureInfo]::InvariantCulture
+
 # ================================================================
 # SECTION 1: CONSTANTS & GLOBAL STATE
 # ================================================================
@@ -130,6 +152,7 @@ $script:TOOL_NAME      = 'ZavetSec-EVTXHunter'
 $script:StartTime      = Get-Date
 $script:TotalParsed    = 0
 $script:TotalHits      = 0
+$script:ParseErrors    = 0   # events that failed to parse (corrupt XML / bad EventID)
 
 $script:SeverityWeight = @{
     'Info'     = 0
@@ -182,25 +205,33 @@ $script:EntityScores = [System.Collections.Hashtable]::new()
 $script:WhitelistRules = @()
 
 # Built-in vendor whitelist. Test-WhitelistMatch compares each RawFields[field] with
-# -like (wildcards), scoped to RuleID when set. These suppress the highest-volume
-# false positives seen in real estates: AV/EDR/management agents reinstalling their
-# own signed services from temp/ProgramData on every update. A genuinely malicious
-# service in these paths still fires PE-002 (obfuscation) or via correlation; this only
+# -like (wildcards), scoped to RuleID when set. These suppress common AV/EDR false
+# positives where vendors reinstall signed services on update. A genuinely malicious
+# service still fires PE-002 (obfuscation) or surfaces via correlation; this only
 # silences known-good vendor ImagePaths on the path-context rules (PE-001 / PE-002b).
-# Override or extend with -Whitelist <json>.
+#
+# Scope note: this built-in list is intentionally CONSERVATIVE. Host-specific AV driver
+# paths (e.g. Kaspersky's "\DRIVERS\K4W-xx-xx\kl*.sys" family, which can be dozens of
+# entries per host) are deliberately NOT baked in here - they vary by product/version
+# and belong in YOUR environment's -Whitelist JSON, not in a tool others will run on
+# different stacks. Windows-managed DriverStore installs are handled separately by
+# PE-001's FieldNotRegex, not here. Override or extend with -Whitelist <json>.
 $script:DefaultWhitelist = @(
-    # Windows Defender platform + KSL definition-update driver services
+    # Windows Defender platform service
     @{ RuleID='ZVS-PE-001';  Fields=@{ 'ImagePath'='*\Windows Defender\*' } }
     @{ RuleID='ZVS-PE-002b'; Fields=@{ 'ImagePath'='*\Windows Defender\*' } }
     @{ RuleID='ZVS-PE-001';  Fields=@{ 'ImagePath'='*MpKslDrv.sys*' } }
     @{ RuleID='ZVS-PE-002b'; Fields=@{ 'ImagePath'='*MpKslDrv.sys*' } }
-    # Kaspersky removal/deployment wrappers (KAVREM) and KES/KSC binaries
+    # Kaspersky removal/deployment wrapper staged in TEMP (KAVREM) - the PE-002b case
     @{ RuleID='ZVS-PE-002b'; Fields=@{ 'ImagePath'='*\KAVREM~1\*' } }
+    # Kaspersky standard install layouts (KES/KSC). These cover Program Files-style
+    # paths; the per-host \DRIVERS\K4W-* driver family is intentionally left to user JSON.
     @{ RuleID='ZVS-PE-001';  Fields=@{ 'ImagePath'='*\Kaspersky Lab\*' } }
     @{ RuleID='ZVS-PE-002b'; Fields=@{ 'ImagePath'='*\Kaspersky Lab\*' } }
     @{ RuleID='ZVS-PE-001';  Fields=@{ 'ImagePath'='*\Kaspersky*\Bases\*' } }
     @{ RuleID='ZVS-PE-002b'; Fields=@{ 'ImagePath'='*\Kaspersky*\Bases\*' } }
 )
+
 
 
 # ================================================================
@@ -210,9 +241,9 @@ $script:DefaultWhitelist = @(
 function Write-Banner {
     $banner = @"
 
- ______                 _    _____            
-|___  /                | |  / ____|           
-   / /  __ ___   ______| |_| (___  ___  ___  
+ ______                    _    _____            
+|___  /                   | |  / ____|           
+   / /  __ ___   _____  _| |_| (___   ___  ___  
   / /  / _' \ \ / / _ \| __\___ \ / _ \/ __|
  / /__| (_| |\ V /  __/| |_ ____) |  __/ (__  
 /_____|\__,_| \_/ \___| \__|_____/ \___|\___|
@@ -352,6 +383,9 @@ function Test-WhitelistMatch {
     foreach ($wlRule in @($script:DefaultWhitelist) + @($script:WhitelistRules)) {
         # Check RuleID match
         if ($wlRule.RuleID -and $wlRule.RuleID -ne $Rule.RuleID) { continue }
+        # A whitelist rule with no field conditions must NOT silently match everything.
+        # (This previously suppressed all findings when a JSON rule had an empty Fields.)
+        if ($null -eq $wlRule.Fields -or $wlRule.Fields.Keys.Count -eq 0) { continue }
         $matched = $true
         foreach ($field in $wlRule.Fields.Keys) {
             $val = $Event.RawFields[$field]
@@ -417,10 +451,10 @@ function ConvertFrom-EventXml {
 
     try {
         $xmlStr = $RawEvent.ToXml()
-        if ([string]::IsNullOrEmpty($xmlStr)) { return $null }
+        if ([string]::IsNullOrEmpty($xmlStr)) { $script:ParseErrors++; return $null }
         [xml]$xml = $xmlStr
     }
-    catch { return $null }
+    catch { $script:ParseErrors++; return $null }
 
     $sys = $xml.Event.System
 
@@ -433,13 +467,17 @@ function ConvertFrom-EventXml {
         } else {
             $eid = [int]$eidNode
         }
-    } catch { return $null }
+    } catch { $script:ParseErrors++; return $null }
 
-    # Parse TimeCreated
+    # Parse TimeCreated. EVTX SystemTime is ISO-8601 UTC (suffix 'Z'). Parse with
+    # RoundtripKind so the resulting DateTime keeps Kind=Utc deterministically,
+    # instead of being silently converted to the analyst machine's local time.
     $tc = $null
     try {
         $tcStr = $sys.TimeCreated.SystemTime
-        if (-not [datetime]::TryParse($tcStr, [ref]$tc)) {
+        if (-not [datetime]::TryParse(
+                $tcStr, [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$tc)) {
             $tc = [datetime]::UtcNow
         }
     } catch { $tc = [datetime]::UtcNow }
@@ -1109,9 +1147,13 @@ $script:DetectionRules = @(
     [PSCustomObject]@{
         RuleID           = 'ZVS-PE-001'
         Title            = 'New Service Installed'
-        Description      = 'A new Windows service was installed. Service creation is a common persistence mechanism but is also extremely common for legitimate software/driver installs, so this is low-severity context on its own - escalate via ZVS-PE-002 (suspicious path) or correlation.'
+        Description      = 'A new Windows service was installed. Service creation is a common persistence mechanism but is also extremely common for legitimate software/driver installs, so this is low-severity context on its own - escalate via ZVS-PE-002 (suspicious path) or correlation. Drivers installed through the Windows-managed DriverStore (DriverStore\FileRepository) are suppressed: that path is INF-staged and signature-gated by Windows and is overwhelmingly device drivers (GPU/audio/chipset/AV filter drivers), not attacker persistence. Note: plain System32\drivers\*.sys is intentionally NOT suppressed, because Bring-Your-Own-Vulnerable-Driver (BYOVD) attacks stage signed drivers there.'
         EventIDs         = @(7045)
         Channels         = @('System')
+        # Suppress only the Windows-managed driver store. This is a path *class*, not a
+        # vendor list - it generalizes to any host (Intel/NVIDIA/Realtek/Kaspersky/VBox
+        # all install device drivers through FileRepository) without chasing publishers.
+        FieldNotRegex    = @{ 'ImagePath' = '(?i)DriverStore[\\/]+FileRepository[\\/]+' }
         Threshold        = $null
         Severity         = 'Low'
         MitreTactic      = 'TA0003'
@@ -1119,7 +1161,7 @@ $script:DetectionRules = @(
         MitreTechnique   = 'Create or Modify System Process: Windows Service'
         TacticName       = 'Persistence'
         Recommendation   = 'Verify the service is authorized. Check ServiceName and ImagePath for suspicious paths or names.'
-        FalsePositives   = @('Software installation','IT agent deployment','Windows updates')
+        FalsePositives   = @('Software installation','IT agent deployment','Windows updates','Signed device drivers via DriverStore')
     }
 
     # PE-002 (was a single noisy Critical) is split into two rules:
@@ -2042,6 +2084,15 @@ function Test-RuleMatch {
         }
     }
 
+    # 10. FieldExists - every listed field must be present and non-empty
+    if ($Rule.FieldExists) {
+        foreach ($fname in $Rule.FieldExists) {
+            if (-not (Test-FieldCondition -Fields $rf -FieldName $fname -ConditionType 'Exists' -ConditionValue $null)) {
+                return $false
+            }
+        }
+    }
+
     return $true
 }
 
@@ -2477,12 +2528,10 @@ function Invoke-CorrelationEngine {
             $windowEnd   = $anchorTime.AddSeconds($maxWindow)
 
             $allStepsMatched = $true
-            $lastStepTime    = $anchorTime   # enforce ordering across steps
 
             for ($si = 1; $si -lt $chain.Steps.Count; $si++) {
                 $step = $chain.Steps[$si]
                 $stepMatches = [System.Collections.Generic.List[object]]::new()
-                $earliestThisStep = $null
 
                 foreach ($eid in $step.EventIDs) {
                     if ($script:IdxByEventID.ContainsKey($eid)) {
@@ -2497,9 +2546,6 @@ function Invoke-CorrelationEngine {
 
                             if (Test-StepMatch -Event $e -Step $step) {
                                 $stepMatches.Add($e)
-                                if ($null -eq $earliestThisStep -or $e.TimeCreated -lt $earliestThisStep) {
-                                    $earliestThisStep = $e.TimeCreated
-                                }
                             }
                         }
                     }
@@ -2509,9 +2555,6 @@ function Invoke-CorrelationEngine {
                     $allStepsMatched = $false
                     break
                 }
-                # Track progression (informational; we don't hard-fail on ordering
-                # because some chains legitimately interleave, but we record it).
-                if ($null -ne $earliestThisStep) { $lastStepTime = $earliestThisStep }
             }
 
             if ($allStepsMatched) {
@@ -2595,13 +2638,17 @@ function Invoke-TemporalAnalysis {
 
     $anomalies = 0
 
-    # 1. Off-hours activity: logons outside business hours
+    # 1. Off-hours activity: logons outside business hours.
+    # TimeCreated is UTC (Kind=Utc); shift by the monitored environment's UTC
+    # offset so business hours are evaluated in THAT site's local time, not the
+    # analyst workstation's. Default offset 0 = treat business hours as UTC.
     $authEvents = @(4624, 4625, 4648)
     foreach ($eid in $authEvents) {
         if (-not $script:IdxByEventID.ContainsKey($eid)) { continue }
         foreach ($e in $script:IdxByEventID[$eid]) {
-            $hour = $e.TimeCreated.Hour
-            $dow  = $e.TimeCreated.DayOfWeek
+            $localTime = $e.TimeCreated.ToUniversalTime().AddHours($WorkHoursTimeZoneOffset)
+            $hour = $localTime.Hour
+            $dow  = $localTime.DayOfWeek
 
             $isOffHours = ($hour -lt $WorkHoursStart -or $hour -ge $WorkHoursEnd)
             $isWeekend  = ($dow -eq [DayOfWeek]::Saturday -or $dow -eq [DayOfWeek]::Sunday)
@@ -2616,31 +2663,29 @@ function Invoke-TemporalAnalysis {
 
             Add-EntityScore -EntityType 'User' -EntityKey $user `
                 -Severity 'Low' -Multiplier $multiplier `
-                -Reason "Authentication event ($eid) at $timeLabel [$($e.TimeCreated.ToString('yyyy-MM-dd HH:mm'))]"
+                -Reason "Authentication event ($eid) at $timeLabel [$($localTime.ToString('yyyy-MM-dd HH:mm'))]"
             $anomalies++
         }
     }
 
-    # 2. Burst detection: high event rate for a specific entity
+    # 2. Burst detection: high event rate for a specific entity.
+    # Proper sliding window (monotonic two-pointer, O(n)) - mirrors the threshold
+    # engine. The previous tumbling-window reset could under-count bursts that
+    # straddle a reset boundary.
     foreach ($user in $script:IdxByUser.Keys) {
         if (Test-IsMachineOrServiceAccount $user) { continue }
-        $userEvents = $script:IdxByUser[$user] | Sort-Object TimeCreated
+        $userEvents = @($script:IdxByUser[$user] | Sort-Object TimeCreated)
         if ($userEvents.Count -lt 20) { continue }
 
-        # Check for bursts of 20+ events in 60 seconds
-        $windowStart = $userEvents[0].TimeCreated
-        $windowCount = 1
-        $maxBurst    = 1
-
-        for ($i = 1; $i -lt $userEvents.Count; $i++) {
-            $elapsed = ($userEvents[$i].TimeCreated - $windowStart).TotalSeconds
-            if ($elapsed -le 60) {
-                $windowCount++
-                if ($windowCount -gt $maxBurst) { $maxBurst = $windowCount }
-            } else {
-                $windowStart = $userEvents[$i].TimeCreated
-                $windowCount = 1
+        # Largest number of events falling inside any 60-second sliding window.
+        $left     = 0
+        $maxBurst = 1
+        for ($right = 0; $right -lt $userEvents.Count; $right++) {
+            while ((($userEvents[$right].TimeCreated - $userEvents[$left].TimeCreated).TotalSeconds) -gt 60) {
+                $left++
             }
+            $windowSize = $right - $left + 1
+            if ($windowSize -gt $maxBurst) { $maxBurst = $windowSize }
         }
 
         if ($maxBurst -ge 20) {
@@ -3094,7 +3139,7 @@ function Get-HtmlTemplate {
       <div class="card" style="padding:0;overflow:hidden">
         <table class="tbl" id="findings-table">
           <thead><tr>
-            <th onclick="sortTable(0)">Time &#8597;</th>
+            <th onclick="sortTable(0)">Time (UTC) &#8597;</th>
             <th onclick="sortTable(1)">Severity &#8597;</th>
             <th onclick="sortTable(2)">Rule</th>
             <th onclick="sortTable(3)">Title</th>
@@ -3123,7 +3168,7 @@ function Get-HtmlTemplate {
         <table class="tbl">
           <thead><tr>
             <th>Severity</th><th>Chain ID</th><th>Title</th>
-            <th>Host</th><th>First Seen</th><th>Tactics</th><th>Recommendation</th>
+            <th>Host</th><th>First Seen (UTC)</th><th>Tactics</th><th>Recommendation</th>
           </tr></thead>
           <tbody>$chainRows</tbody>
         </table>
@@ -3267,7 +3312,7 @@ function openFinding(id) {
     <div class="modal-title">${f.title}</div>
     <div class="modal-desc">${f.desc}</div>
     <div class="modal-row"><span class="modal-key">Rule ID</span><span class="modal-val">${f.rule}</span></div>
-    <div class="modal-row"><span class="modal-key">Time</span><span class="modal-val">${f.ts}</span></div>
+    <div class="modal-row"><span class="modal-key">Time (UTC)</span><span class="modal-val">${f.ts}</span></div>
     <div class="modal-row"><span class="modal-key">Computer</span><span class="modal-val">${f.computer||'-'}</span></div>
     <div class="modal-row"><span class="modal-key">Event ID</span><span class="modal-val">${f.eid}</span></div>
     <div class="modal-row"><span class="modal-key">Subject User</span><span class="modal-val">${f.subj||'-'}</span></div>
@@ -3470,11 +3515,31 @@ function Main {
         }
     }
 
-    # Load external whitelist
+    # Sanity-check business hours (overnight ranges are not supported by the
+    # off-hours logic; warn and fall back to defaults instead of flagging 100%).
+    if ($WorkHoursEnd -le $WorkHoursStart) {
+        Write-Status "WorkHoursEnd ($WorkHoursEnd) must be greater than WorkHoursStart ($WorkHoursStart). Falling back to 9-18." 'WARN'
+        $script:WorkHoursStart = 9
+        $script:WorkHoursEnd   = 18
+    }
+
+    # Load external whitelist. ConvertFrom-Json yields PSCustomObjects whose
+    # nested .Fields has no .Keys; convert each rule's Fields to a real hashtable
+    # so Test-WhitelistMatch can enumerate it like the built-in defaults.
     if (-not [string]::IsNullOrEmpty($Whitelist) -and (Test-Path $Whitelist)) {
         try {
-            $script:WhitelistRules = Get-Content $Whitelist -Raw | ConvertFrom-Json
-            Write-Status "Whitelist loaded: $($script:WhitelistRules.Count) rules" 'OK'
+            $rawRules = Get-Content $Whitelist -Raw | ConvertFrom-Json
+            $converted = foreach ($r in @($rawRules)) {
+                $fields = @{}
+                if ($r.PSObject.Properties['Fields'] -and $null -ne $r.Fields) {
+                    foreach ($p in $r.Fields.PSObject.Properties) { $fields[$p.Name] = $p.Value }
+                }
+                @{ RuleID = $r.RuleID; Fields = $fields }
+            }
+            # Drop rules with no field conditions - they would suppress everything.
+            $script:WhitelistRules = @($converted | Where-Object { $_.Fields.Keys.Count -gt 0 })
+            $skipped = @($converted).Count - $script:WhitelistRules.Count
+            Write-Status "Whitelist loaded: $($script:WhitelistRules.Count) rules$(if($skipped){" ($skipped skipped: empty Fields)"})" 'OK'
         }
         catch {
             Write-Status "Failed to load whitelist: $_" 'WARN'
@@ -3550,6 +3615,9 @@ function Main {
     Write-Host '================================================================' -ForegroundColor DarkGray
     Write-Host " SCAN COMPLETE - ${duration}s" -ForegroundColor Green
     Write-Host "  Events Parsed : $($script:TotalParsed.ToString('N0'))" -ForegroundColor White
+    if ($script:ParseErrors -gt 0) {
+        Write-Host "  Parse Errors  : $($script:ParseErrors.ToString('N0')) (events skipped - corrupt XML/EventID)" -ForegroundColor Yellow
+    }
     Write-Host "  Total Findings: $($script:Findings.Count)" -ForegroundColor White
     Write-Host "  Critical      : $( ($script:Findings | Where-Object Severity -eq 'Critical').Count )" -ForegroundColor Red
     Write-Host "  High          : $( ($script:Findings | Where-Object Severity -eq 'High').Count )" -ForegroundColor Yellow

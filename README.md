@@ -8,7 +8,7 @@
 **Pure PowerShell. Zero dependencies. Air-gap ready.**
 
 <!-- Version is driven by $script:VERSION in the script; keep this badge in sync. -->
-[![Version](https://img.shields.io/badge/Version-1.0.0-ff6b00)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-1.2.0-ff6b00)](CHANGELOG.md)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)](#requirements)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6)](#requirements)
 [![Dependencies](https://img.shields.io/badge/Dependencies-none-00ff88)](#why-evtxhunter)
@@ -34,7 +34,12 @@ The entire output is a single self-contained HTML file — no server, no interne
      Suggested captures: full overview, MITRE matrix, top-risk entities, a correlation chain expanded. -->
 <div align="center">
 
-<img width="1738" height="868" alt="evtxhunter" src="https://github.com/user-attachments/assets/2b1dfa6d-5c5f-455a-ad27-c6ccf2284002" />
+<img src="docs/report-overview.png" width="100%" alt="Findings dashboard ranked by severity">
+
+<br><br>
+
+<img src="docs/report-mitre.png" width="49%" alt="MITRE ATT&CK tactic matrix">
+<img src="docs/report-entities.png" width="49%" alt="Top-risk entity scoring board">
 
 </div>
 
@@ -60,12 +65,12 @@ The trade-off is honest: a binary engine with the full public Sigma corpus has f
 
 ## Features
 
-- **11 correlation chains** — multi-event attack sequences reconstructed across time, e.g. *Brute Force -> Successful Logon*, *Reconnaissance -> Lateral Movement*, *Service Install -> Log Clearing*, *Account Creation -> Admin Group Addition*. This is the part single-event rules miss.
+- **10 correlation chains** — multi-event attack sequences reconstructed across time, e.g. *Brute Force -> Successful Logon*, *Reconnaissance -> Lateral Movement*, *Service Install -> Log Clearing*, *Account Creation -> Admin Group Addition*. This is the part single-event rules miss.
 - **Entity risk scoring** — every user, IP, host, and process accumulates a normalized risk score across all findings and anomalies, so the report tells you *who* and *what* to look at first, not just *what fired*.
-- **Temporal anomaly engine** — off-hours and weekend authentication, burst activity, and dormant-account wakeups, with machine/service accounts (SYSTEM, DWM-*, UMFD-*, machine `$`, well-known SIDs, AV service accounts) filtered out so the signal isn't drowned in noise.
+- **Temporal anomaly engine** — off-hours and weekend authentication, burst activity, and dormant-account wakeups (an account inactive for `-DormantDays` that suddenly authenticates), with machine/service accounts (SYSTEM, DWM-*, UMFD-*, machine `$`, well-known SIDs, AV service accounts) filtered out so the signal isn't drowned in noise.
 - **Interactive HTML report** — self-contained, opens in any browser with no internet. Severity-ranked findings, click any row for full event detail, MITRE ATT&CK tactic matrix, top-risk entity board, reconstructed chains.
 - **Noise control that doesn't go blind** — Windows-managed driver installs (the `DriverStore\FileRepository` class) are suppressed automatically, and a built-in vendor whitelist plus an external JSON whitelist (which *extends* the defaults, never replaces them) handle the rest. Plain `System32\drivers\*.sys` installs are deliberately *kept* as low-severity findings, because that path is the Bring-Your-Own-Vulnerable-Driver (BYOVD) attack surface — suppressing it would hide exactly what an attacker exploits.
-- **63 built-in detection rules** — a curated Sigma-subset covering the techniques that actually show up in Windows IR, written directly against event fields (no external rule files to ship or update).
+- **54 built-in detection rules** — a curated Sigma-subset covering the techniques that actually show up in Windows IR, written directly against event fields (no external rule files to ship or update).
 - **File or live** — analyze a directory of collected `.evtx`, or scan the live logs on the host you're triaging.
 
 ---
@@ -85,8 +90,8 @@ The trade-off is honest: a binary engine with the full public Sigma corpus has f
 # Only surface High and Critical, output all formats
 .\Invoke-ZavetSecEVTXHunter.ps1 -Path .\evtx -MinSeverity High -OutputFormat All
 
-# Tune business hours and apply your own whitelist
-.\Invoke-ZavetSecEVTXHunter.ps1 -Path .\evtx -WorkHoursStart 8 -WorkHoursEnd 19 -Whitelist .\zavetsec-whitelist.example.json
+# Tune business hours (in the monitored site's UTC+5 zone) and apply your own whitelist
+.\Invoke-ZavetSecEVTXHunter.ps1 -Path .\evtx -WorkHoursStart 8 -WorkHoursEnd 19 -WorkHoursTimeZoneOffset 5 -Whitelist .\zavetsec-whitelist.example.json
 ```
 
 Output is written to the output directory as `ZavetSec-EVTXHunter_<timestamp>.html` (and `.json` / `.csv` when requested).
@@ -106,6 +111,8 @@ Output is written to the output directory as `ZavetSec-EVTXHunter_<timestamp>.ht
 | `-DisableCorrelation` | off | Skip the correlation engine (faster on huge datasets) |
 | `-WorkHoursStart <0-23>` | `9` | Start of business hours for off-hours detection |
 | `-WorkHoursEnd <1-23>` | `18` | End of business hours for off-hours detection |
+| `-WorkHoursTimeZoneOffset <-14..14>` | `0` (UTC) | UTC offset of the *monitored* environment, so business hours are judged in the site's local time, not the analyst workstation's |
+| `-DormantDays <int>` | `30` | Days of inactivity after which an account's next logon is flagged as a dormant-account wakeup (`0` disables) |
 | `-MaxEvents <int>` | `1000000` | Cap on events parsed |
 | `-TimeRangeHours <int>` | `0` (all) | Only analyze events within the last N hours |
 | `-Whitelist <path>` | none | JSON file of additional whitelist rules (extends built-in defaults) |
@@ -114,7 +121,7 @@ Output is written to the output directory as `ZavetSec-EVTXHunter_<timestamp>.ht
 
 ## Detection coverage
 
-63 rules and 11 correlation chains spanning **9 MITRE ATT&CK tactics**:
+54 rules and 10 correlation chains spanning **9 MITRE ATT&CK tactics**:
 
 | Tactic | Focus |
 |---|---|
@@ -210,18 +217,18 @@ _Benchmarks pending — will be published from a representative dataset on a sta
    └──────────┘
         │
         ▼
-   ┌────────────────────┐   63 Sigma-subset rules + whitelist
+   ┌────────────────────┐   54 Sigma-subset rules + whitelist
    │  Detection engine  │
    └────────────────────┘
         │
         ▼
-   ┌──────────────────────┐   11 multi-event attack chains
+   ┌──────────────────────┐   10 multi-event attack chains
    │  Correlation engine  │
    └──────────────────────┘
         │
         ▼
    ┌─────────────────┐   per-entity risk: users / IPs / hosts / procs
-   │  Risk scoring   │   + temporal anomalies (off-hours / burst)
+   │  Risk scoring   │   + temporal anomalies (off-hours / burst / dormant)
    └─────────────────┘
         │
         ▼
@@ -229,10 +236,10 @@ _Benchmarks pending — will be published from a representative dataset on a sta
 ```
 
 1. **Parse** — reads `.evtx` (file mode) or live channels (live mode), normalizing each event's fields into a queryable structure and indexing by Event ID and account.
-2. **Detect** — runs the 63-rule engine over the indexed events, applying the whitelist to suppress known-good noise.
+2. **Detect** — runs the 54-rule engine over the indexed events, applying the whitelist to suppress known-good noise.
 3. **Correlate** — the chain engine looks for multi-event attack sequences within time windows.
 4. **Score** — every finding feeds a per-entity risk score for users, IPs, hosts, and processes; temporal anomalies add weighted context.
-5. **Report** — emits a self-contained interactive HTML report (and optional JSON/CSV) ready to read or hand off.
+5. **Report** — emits a self-contained interactive HTML report (and optional JSON/CSV) ready to read or hand off. Event timestamps in the report are shown in **UTC** (the EVTX native time base), so findings line up across hosts in different time zones.
 
 ---
 
@@ -240,7 +247,7 @@ _Benchmarks pending — will be published from a representative dataset on a sta
 
 - [ ] Amcache / ShimCache enrichment
 - [ ] Sigma rule import (map external Sigma YAML onto the engine)
-- [ ] Timeline view in the HTML report
+- [x] Timeline view in the HTML report
 - [ ] Pluggable rule packs per environment profile
 
 ---
