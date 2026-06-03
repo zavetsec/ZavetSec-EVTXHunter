@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    ZavetSec-EVTXHunter v1.2.0 - Advanced Windows Event Log Threat Hunter
+    ZavetSec-EVTXHunter v1.3.0 - Advanced Windows Event Log Threat Hunter
 
 .DESCRIPTION
     Threat hunting and DFIR analysis tool for Windows Event Logs (EVTX).
@@ -18,13 +18,23 @@
 
 .PARAMETER Path
     Path to a single EVTX file or directory containing EVTX files (recursive).
+    When a directory is given, only files belonging to channels the rules cover
+    are parsed; the rest are skipped to save time (see -AllFiles).
+
+.PARAMETER AllFiles
+    In directory (File) mode, parse EVERY .evtx found regardless of channel,
+    instead of limiting to the channels the detection rules cover. Useful when
+    evidence files have been renamed or you want a raw exhaustive pass.
 
 .PARAMETER LiveScan
     Scan live Windows Event Logs on the local system.
 
 .PARAMETER LogNames
-    When using -LiveScan, specify which logs to scan.
-    Default: Security, System, Application, Microsoft-Windows-PowerShell/Operational
+    When using -LiveScan, specify which logs to scan. Default set covers the
+    channels the rules target: Security, System, Application,
+    PowerShell/Operational, Sysmon/Operational, TaskScheduler/Operational,
+    WMI-Activity/Operational, Windows Defender/Operational, and both
+    TerminalServices (Local/RemoteConnection) Operational channels.
 
 .PARAMETER OutputPath
     Directory for output files. Default: current directory.
@@ -45,7 +55,8 @@
     Business hours end in 24h format for temporal analysis. Default: 18
 
 .PARAMETER MaxEvents
-    Maximum events to process per log/file. 0 = unlimited. Default: 1000000
+    Maximum events to process. In live mode this is a global budget across all
+    channels; in file mode it caps each file. 0 = unlimited. Default: 1000000
 
 .PARAMETER TimeRangeHours
     Process only events from the last N hours. 0 = all events. Default: 0
@@ -88,15 +99,18 @@
 
 .NOTES
     Author  : ZavetSec Research
-    Version : 1.2.0
+    Version : 1.3.0
     Tags    : DFIR, Threat Hunting, EVTX, Sigma, Windows Event Logs
     License : MIT
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'File')]
 param(
-    [Parameter(ParameterSetName = 'File', Mandatory = $true, Position = 0)]
+    [Parameter(ParameterSetName = 'File', Position = 0)]
     [string]$Path,
+
+    [Parameter(ParameterSetName = 'File')]
+    [switch]$AllFiles,
 
     [Parameter(ParameterSetName = 'Live', Mandatory = $true)]
     [switch]$LiveScan,
@@ -107,7 +121,12 @@ param(
         'System',
         'Application',
         'Microsoft-Windows-PowerShell/Operational',
-        'Microsoft-Windows-Sysmon/Operational'
+        'Microsoft-Windows-Sysmon/Operational',
+        'Microsoft-Windows-TaskScheduler/Operational',
+        'Microsoft-Windows-WMI-Activity/Operational',
+        'Microsoft-Windows-Windows Defender/Operational',
+        'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational',
+        'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational'
     ),
 
     [string]$OutputPath = (Get-Location).Path,
@@ -156,7 +175,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 # SECTION 1: CONSTANTS & GLOBAL STATE
 # ================================================================
 
-$script:VERSION        = '1.2.0'
+$script:VERSION        = '1.3.0'
 $script:TOOL_NAME      = 'ZavetSec-EVTXHunter'
 $script:StartTime      = Get-Date
 $script:TotalParsed    = 0
@@ -190,6 +209,23 @@ $script:SeverityColor = @{
 
 # Global event store used by correlation engine
 $script:AllEvents   = [System.Collections.Generic.List[object]]::new()
+
+# Channels the detection rules actually cover. Used in directory (File) mode to
+# skip .evtx files with no rule coverage so we don't waste time parsing the ~100
+# diagnostic/telemetry channels in winevt\Logs. KEEP IN SYNC with the -LogNames
+# default above. Override the skipping with -AllFiles.
+$script:SupportedChannels = @(
+    'Security',
+    'System',
+    'Application',
+    'Microsoft-Windows-PowerShell/Operational',
+    'Microsoft-Windows-Sysmon/Operational',
+    'Microsoft-Windows-TaskScheduler/Operational',
+    'Microsoft-Windows-WMI-Activity/Operational',
+    'Microsoft-Windows-Windows Defender/Operational',
+    'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational',
+    'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational'
+)
 
 # Indexed stores for O(1) correlation lookups
 $script:IdxByEventID = [System.Collections.Hashtable]::new()
@@ -250,9 +286,9 @@ $script:DefaultWhitelist = @(
 function Write-Banner {
     $banner = @"
 
- ______                   _    _____            
-|___  /                  | |  / ____|           
-   / /  __ ___   _____  _| |_| (______  ___  
+ ______                    _    _____            
+|___  /                   | |  / ____|           
+   / /  __ ___   _____  _| |_| (___   ___  ___  
   / /  / _' \ \ / / _ \| __\___ \ / _ \/ __|
  / /__| (_| |\ V /  __/| |_ ____) |  __/ (__  
 /_____|\__,_| \_/ \___| \__|_____/ \___|\___|
@@ -281,6 +317,21 @@ function Write-Status {
     Write-Host "[$ts] " -NoNewline -ForegroundColor DarkGray
     Write-Host "[$Type] " -NoNewline -ForegroundColor $color
     Write-Host $Message -ForegroundColor White
+}
+
+function Test-IsElevated {
+    <#
+    .SYNOPSIS
+        True if the current process runs with Administrator rights. Reading the
+        live Security channel requires elevation; without it that log is empty.
+    #>
+    try {
+        $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = [System.Security.Principal.WindowsPrincipal]::new($id)
+        return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
 }
 
 function ConvertTo-JsonString {
@@ -678,8 +729,34 @@ function Read-EVTXFile {
 function Read-LiveLogs {
     param([string[]]$Logs)
 
+    # The Security channel needs Administrator. Warn once up front rather than
+    # letting it silently come back empty.
+    if (($Logs -contains 'Security') -and -not (Test-IsElevated)) {
+        Write-Status "Not elevated: the live Security log requires Administrator and will be empty. Re-run from an elevated PowerShell for full coverage." 'WARN'
+    }
+
     foreach ($logName in $Logs) {
+        # -MaxEvents is a GLOBAL budget across all channels (0 = unlimited).
+        if ($MaxEvents -gt 0 -and $script:TotalParsed -ge $MaxEvents) {
+            Write-Status "MaxEvents cap ($MaxEvents) reached - skipping remaining channels" 'WARN'
+            break
+        }
+
         Write-Status "Live scan: $logName" 'INFO'
+
+        # Resolve the channel first. A missing provider (e.g. Sysmon not installed)
+        # or an empty channel otherwise surfaces as Get-WinEvent's cryptic
+        # "The parameter is incorrect" - report it clearly instead.
+        $logInfo = Get-WinEvent -ListLog $logName -ErrorAction SilentlyContinue
+        if ($null -eq $logInfo) {
+            Write-Status "  '$logName': channel not present on this host - skipping (is the provider installed?)" 'WARN'
+            continue
+        }
+        if (($logInfo.RecordCount -eq 0 -or $null -eq $logInfo.RecordCount) -and $TimeRangeHours -le 0) {
+            Write-Status "  '$logName': channel present but empty - skipping" 'INFO'
+            continue
+        }
+
         $count = 0
 
         try {
@@ -688,19 +765,43 @@ function Read-LiveLogs {
                 $filterHash['StartTime'] = (Get-Date).AddHours(-$TimeRangeHours)
             }
 
-            $events = Get-WinEvent -FilterHashtable $filterHash -MaxEvents ([Math]::Max($MaxEvents, 100000)) -Oldest -ErrorAction SilentlyContinue
-            if ($null -eq $events) { continue }
+            # Honor the user's cap as a global budget; 0 = unlimited.
+            $remaining = if ($MaxEvents -gt 0) { $MaxEvents - $script:TotalParsed } else { 0 }
+
+            $events = $null
+            try {
+                $gwParams = @{ FilterHashtable = $filterHash; Oldest = $true; ErrorAction = 'Stop' }
+                if ($remaining -gt 0) { $gwParams['MaxEvents'] = $remaining }
+                $events = Get-WinEvent @gwParams
+            }
+            catch {
+                # Known Get-WinEvent quirk on some empty/edge channels: retry via the
+                # simpler -LogName form (only valid when no time filter is applied).
+                if ($TimeRangeHours -le 0) {
+                    $lp = @{ LogName = $logName; Oldest = $true; ErrorAction = 'Stop' }
+                    if ($remaining -gt 0) { $lp['MaxEvents'] = $remaining }
+                    $events = Get-WinEvent @lp
+                } else {
+                    throw
+                }
+            }
+
+            if ($null -eq $events) {
+                Write-Status "  '$logName': no matching events" 'INFO'
+                continue
+            }
 
             foreach ($rawEvent in $events) {
                 $parsed = ConvertFrom-EventXml -RawEvent $rawEvent
-                if ($null -eq $parsed) { continue }
-                $script:AllEvents.Add($parsed)
-                Add-EventToIndex -ParsedEvent $parsed
-                $count++
+                if ($null -ne $parsed) {
+                    $script:AllEvents.Add($parsed)
+                    Add-EventToIndex -ParsedEvent $parsed
+                    $count++
+                }
             }
         }
         catch {
-            Write-Status "  Cannot access '$logName' (may not exist or no permission)" 'WARN'
+            Write-Status "  Cannot access '$logName': $($_.Exception.Message)" 'WARN'
         }
 
         if ($count -gt 0) {
@@ -1750,6 +1851,124 @@ $script:DetectionRules = @(
         TacticName       = 'Discovery'
         Recommendation   = 'A burst of these commands from one host indicates hands-on-keyboard reconnaissance. Identify the user/process and correlate with the preceding initial access event.'
         FalsePositives   = @('Administrators and inventory/monitoring tools running discovery; tune threshold per environment')
+    }
+
+    # ================================================================
+    # NEW-CHANNEL COVERAGE (TaskScheduler / WMI-Activity / Defender / TerminalServices)
+    # ================================================================
+
+    [PSCustomObject]@{
+        RuleID           = 'ZVS-PE-006'
+        Title            = 'Scheduled Task Registered (TaskScheduler Operational)'
+        Description      = 'A scheduled task was registered, observed on the TaskScheduler/Operational channel (EID 106). Complements Security 4698 - catches task creation on hosts where 4698 auditing is disabled. Microsoft-managed tasks are filtered out.'
+        EventIDs         = @(106)
+        Channels         = @('Microsoft-Windows-TaskScheduler/Operational')
+        FieldNotRegex    = @{ 'TaskName' = '(?i)^\\Microsoft\\Windows\\' }
+        Threshold        = $null
+        Severity         = 'Low'
+        MitreTactic      = 'TA0003'
+        MitreTechniqueID = 'T1053.005'
+        MitreTechnique   = 'Scheduled Task/Job: Scheduled Task'
+        TacticName       = 'Persistence'
+        Recommendation   = 'Identify the task name and the user that registered it. Cross-check the task action against Security 4698 TaskContent if available.'
+        FalsePositives   = @('Software installers and updaters registering tasks','Third-party management agents')
+    }
+
+    [PSCustomObject]@{
+        RuleID           = 'ZVS-DE-009'
+        Title            = 'Scheduled Task Deleted (TaskScheduler Operational)'
+        Description      = 'A scheduled task was deleted (EID 141). Attackers remove tasks to cover persistence after use; can also indicate anti-forensic cleanup. Microsoft-managed tasks are filtered out.'
+        EventIDs         = @(141)
+        Channels         = @('Microsoft-Windows-TaskScheduler/Operational')
+        FieldNotRegex    = @{ 'TaskName' = '(?i)^\\Microsoft\\Windows\\' }
+        Threshold        = $null
+        Severity         = 'Low'
+        MitreTactic      = 'TA0005'
+        MitreTechniqueID = 'T1070'
+        MitreTechnique   = 'Indicator Removal'
+        TacticName       = 'Defense Evasion'
+        Recommendation   = 'Correlate the deleted task name with any prior registration (106) and the user context. Sudden create-then-delete of a non-Microsoft task is suspicious.'
+        FalsePositives   = @('Uninstallers removing their own tasks','Administrative task cleanup')
+    }
+
+    [PSCustomObject]@{
+        RuleID           = 'ZVS-PE-007'
+        Title            = 'WMI Permanent Event Consumer Registered (WMI-Activity)'
+        Description      = 'A permanent WMI event consumer/subscription was registered, observed natively on WMI-Activity/Operational (EID 5861). A classic stealthy persistence mechanism that survives reboot. Complements the Sysmon-based WMI subscription rule.'
+        EventIDs         = @(5861)
+        Channels         = @('Microsoft-Windows-WMI-Activity/Operational')
+        Threshold        = $null
+        Severity         = 'Medium'
+        MitreTactic      = 'TA0003'
+        MitreTechniqueID = 'T1546.003'
+        MitreTechnique   = 'Event Triggered Execution: WMI Event Subscription'
+        TacticName       = 'Persistence'
+        Recommendation   = 'Review the consumer command/script in the event detail. Legitimate management tooling (SCCM, monitoring) also uses WMI subscriptions - baseline expected consumers and alert on the rest.'
+        FalsePositives   = @('SCCM / configuration management','Monitoring and inventory agents','Some EDR/AV products')
+    }
+
+    [PSCustomObject]@{
+        RuleID           = 'ZVS-DE-010'
+        Title            = 'Windows Defender Real-Time Protection Disabled'
+        Description      = 'Microsoft Defender Antivirus real-time protection was disabled (Defender/Operational EID 5001). Frequently performed by an attacker (or malware) immediately before deploying a payload.'
+        EventIDs         = @(5001)
+        Channels         = @('Microsoft-Windows-Windows Defender/Operational')
+        Threshold        = $null
+        Severity         = 'High'
+        MitreTactic      = 'TA0005'
+        MitreTechniqueID = 'T1562.001'
+        MitreTechnique   = 'Impair Defenses: Disable or Modify Tools'
+        TacticName       = 'Defense Evasion'
+        Recommendation   = 'Determine who/what disabled real-time protection and when it was (or was not) re-enabled. Correlate with process creation and any payload execution in the same window.'
+        FalsePositives   = @('Administrators toggling protection for legitimate troubleshooting','Conflicting third-party AV taking over')
+    }
+
+    [PSCustomObject]@{
+        RuleID           = 'ZVS-EX-007'
+        Title            = 'Windows Defender Malware Detected'
+        Description      = 'Microsoft Defender Antivirus detected malware (Defender/Operational EID 1116). A direct indicator of malicious code on the host.'
+        EventIDs         = @(1116)
+        Channels         = @('Microsoft-Windows-Windows Defender/Operational')
+        Threshold        = $null
+        Severity         = 'High'
+        MitreTactic      = 'TA0002'
+        MitreTechniqueID = 'T1204.002'
+        MitreTechnique   = 'User Execution: Malicious File'
+        TacticName       = 'Execution'
+        Recommendation   = 'Review the threat name, file path, and detecting process in the event detail. Confirm remediation (1117) succeeded; if blocked-only, the file may persist. Investigate how it arrived.'
+        FalsePositives   = @('EICAR test files','Security testing / red-team tooling flagged by signatures')
+    }
+
+    [PSCustomObject]@{
+        RuleID           = 'ZVS-LM-003'
+        Title            = 'RDP Session Logon (TerminalServices)'
+        Description      = 'An interactive RDP session was established or reconnected, observed on TerminalServices-LocalSessionManager/Operational (EID 21/25), including the source network address. Context for lateral-movement correlation; fires on every RDP session.'
+        EventIDs         = @(21, 25)
+        Channels         = @('Microsoft-Windows-TerminalServices-LocalSessionManager/Operational')
+        Threshold        = $null
+        Severity         = 'Info'
+        MitreTactic      = 'TA0008'
+        MitreTechniqueID = 'T1021.001'
+        MitreTechnique   = 'Remote Services: Remote Desktop Protocol'
+        TacticName       = 'Lateral Movement'
+        Recommendation   = 'Context event. Valuable for establishing who connected via RDP, from where, and when - correlate the source Address with brute-force or off-hours activity rather than treating standalone.'
+        FalsePositives   = @('Normal administrative and user RDP sessions')
+    }
+
+    [PSCustomObject]@{
+        RuleID           = 'ZVS-LM-004'
+        Title            = 'RDP Authentication Succeeded (RemoteConnectionManager)'
+        Description      = 'A remote desktop authentication succeeded, observed on TerminalServices-RemoteConnectionManager/Operational (EID 1149). Records the connecting user and source IP (Param fields) even when Security auditing is sparse.'
+        EventIDs         = @(1149)
+        Channels         = @('Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational')
+        Threshold        = $null
+        Severity         = 'Info'
+        MitreTactic      = 'TA0008'
+        MitreTechniqueID = 'T1021.001'
+        MitreTechnique   = 'Remote Services: Remote Desktop Protocol'
+        TacticName       = 'Lateral Movement'
+        Recommendation   = 'Context event. The connecting user is in Param1 and the source IP in Param3 - correlate external/unexpected source addresses with the rest of the timeline.'
+        FalsePositives   = @('Normal administrative and user RDP connections')
     }
 
 ) # end $script:DetectionRules
@@ -3539,6 +3758,29 @@ function Export-CsvReport {
 function Main {
     Write-Banner
 
+    # No input supplied: show usage instead of prompting for a path.
+    if (-not $LiveScan -and [string]::IsNullOrWhiteSpace($Path)) {
+        Write-Host ""
+        Write-Host "  Usage: analyze EVTX files, or scan the live host." -ForegroundColor White
+        Write-Host ""
+        Write-Host "    # Analyze a directory of .evtx files (recursive)" -ForegroundColor DarkGray
+        Write-Host "    .\Invoke-ZavetSecEVTXHunter.ps1 -Path C:\Evidence\evtx" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "    # Analyze a single file" -ForegroundColor DarkGray
+        Write-Host "    .\Invoke-ZavetSecEVTXHunter.ps1 -Path C:\Windows\System32\winevt\Logs\Security.evtx" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "    # Scan the live host (Administrator needed for the Security log)" -ForegroundColor DarkGray
+        Write-Host "    .\Invoke-ZavetSecEVTXHunter.ps1 -LiveScan" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "    # Only High/Critical, all output formats" -ForegroundColor DarkGray
+        Write-Host "    .\Invoke-ZavetSecEVTXHunter.ps1 -Path .\evtx -MinSeverity High -OutputFormat All" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "  Full help: " -ForegroundColor White -NoNewline
+        Write-Host "Get-Help .\Invoke-ZavetSecEVTXHunter.ps1 -Detailed" -ForegroundColor Cyan
+        Write-Host ""
+        return
+    }
+
     # Validate Path
     if ($PSCmdlet.ParameterSetName -eq 'File') {
         if (-not (Test-Path $Path)) {
@@ -3594,8 +3836,30 @@ function Main {
         $item = Get-Item $Path
 
         if ($item.PSIsContainer) {
-            $evtxFiles = Get-ChildItem -Path $Path -Filter '*.evtx' -Recurse
-            Write-Status "Found $($evtxFiles.Count) EVTX files in $Path" 'INFO'
+            $allEvtx = @(Get-ChildItem -Path $Path -Filter '*.evtx' -Recurse -ErrorAction SilentlyContinue)
+
+            if ($AllFiles) {
+                $evtxFiles = $allEvtx
+                Write-Status "Found $($allEvtx.Count) EVTX files in $Path (parsing ALL - channel filter disabled)" 'INFO'
+            }
+            else {
+                # Keep only files whose channel is covered by the rules. Windows
+                # encodes '/' as '%4' in the filename, so decode before matching.
+                # Archived logs (Archive-Security-*, etc.) match via substring.
+                $evtxFiles = @($allEvtx | Where-Object {
+                    $decoded = ($_.BaseName -replace '%4', '/')
+                    $keep = $false
+                    foreach ($sup in $script:SupportedChannels) {
+                        if ($decoded -ieq $sup -or $decoded -ilike "*$sup*" -or $sup -ilike "*$decoded*") {
+                            $keep = $true; break
+                        }
+                    }
+                    $keep
+                })
+                $skipped = $allEvtx.Count - $evtxFiles.Count
+                Write-Status "Found $($allEvtx.Count) EVTX files; parsing $($evtxFiles.Count) covered, skipping $skipped with no rule coverage (use -AllFiles to parse everything)" 'INFO'
+            }
+
             foreach ($f in $evtxFiles) {
                 Read-EVTXFile -FilePath $f.FullName
             }

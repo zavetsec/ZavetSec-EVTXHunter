@@ -8,7 +8,7 @@
 **Pure PowerShell. Zero dependencies. Air-gap ready.**
 
 <!-- Version is driven by $script:VERSION in the script; keep this badge in sync. -->
-[![Version](https://img.shields.io/badge/Version-1.2.0-ff6b00)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-1.3.0-ff6b00)](CHANGELOG.md)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)](#requirements)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6)](#requirements)
 [![Dependencies](https://img.shields.io/badge/Dependencies-none-00ff88)](#why-evtxhunter)
@@ -38,7 +38,12 @@ The entire output is a single self-contained HTML file — no server, no interne
      Suggested captures: full overview, MITRE matrix, top-risk entities, a correlation chain expanded. -->
 <div align="center">
 
-<img width="1738" height="868" alt="evtxhunter" src="https://github.com/user-attachments/assets/2b1dfa6d-5c5f-455a-ad27-c6ccf2284002" />
+<img src="docs/report-overview.png" width="100%" alt="Findings dashboard ranked by severity">
+
+<br><br>
+
+<img src="docs/report-mitre.png" width="49%" alt="MITRE ATT&CK tactic matrix">
+<img src="docs/report-entities.png" width="49%" alt="Top-risk entity scoring board">
 
 </div>
 
@@ -69,7 +74,7 @@ The trade-off is honest: a binary engine with the full public Sigma corpus has f
 - **Temporal anomaly engine** — off-hours and weekend authentication, burst activity, and dormant-account wakeups (an account inactive for `-DormantDays` that suddenly authenticates), with machine/service accounts (SYSTEM, DWM-*, UMFD-*, machine `$`, well-known SIDs, AV service accounts) filtered out so the signal isn't drowned in noise.
 - **Interactive HTML report** — self-contained, opens in any browser with no internet. Severity-ranked findings, click any row for full event detail, MITRE ATT&CK tactic matrix, top-risk entity board, reconstructed chains.
 - **Noise control that doesn't go blind** — Windows-managed driver installs (the `DriverStore\FileRepository` class) are suppressed automatically, and a built-in vendor whitelist plus an external JSON whitelist (which *extends* the defaults, never replaces them) handle the rest. Plain `System32\drivers\*.sys` installs are deliberately *kept* as low-severity findings, because that path is the Bring-Your-Own-Vulnerable-Driver (BYOVD) attack surface — suppressing it would hide exactly what an attacker exploits.
-- **54 built-in detection rules** — a curated Sigma-subset covering the techniques that actually show up in Windows IR, written directly against event fields (no external rule files to ship or update).
+- **61 built-in detection rules** — a curated Sigma-subset covering the techniques that actually show up in Windows IR, written directly against event fields (no external rule files to ship or update).
 - **File or live** — analyze a directory of collected `.evtx`, or scan the live logs on the host you're triaging.
 
 ---
@@ -101,9 +106,10 @@ Output is written to the output directory as `ZavetSec-EVTXHunter_<timestamp>.ht
 
 | Parameter | Default | Description |
 |---|---|---|
-| `-Path <path>` | *(required, File mode)* | Single `.evtx` file or directory of them (recursive) |
+| `-Path <path>` | *(required, File mode)* | Single `.evtx` file or directory of them (recursive). For a directory, only files from covered channels are parsed |
+| `-AllFiles` | off | In directory mode, parse every `.evtx` regardless of channel (overrides the covered-channel filter) |
 | `-LiveScan` | *(required, Live mode)* | Scan live Windows Event Logs on the local host |
-| `-LogNames <string[]>` | Security, System, Application, PowerShell/Operational, Sysmon/Operational | Which live logs to scan (Live mode) |
+| `-LogNames <string[]>` | 10 channels (Security, System, Application, PowerShell, Sysmon, TaskScheduler, WMI-Activity, Defender, TerminalServices LSM/RCM — all Operational) | Which live logs to scan (Live mode) |
 | `-OutputPath <path>` | current directory | Where reports are written |
 | `-OutputFormat <HTML\|JSON\|CSV\|All>` | `HTML` | Report format(s) to generate |
 | `-MinSeverity <Info\|Low\|Medium\|High\|Critical>` | `Low` | Minimum severity to report |
@@ -120,7 +126,7 @@ Output is written to the output directory as `ZavetSec-EVTXHunter_<timestamp>.ht
 
 ## Detection coverage
 
-54 rules and 10 correlation chains spanning **9 MITRE ATT&CK tactics**:
+61 rules and 10 correlation chains spanning **9 MITRE ATT&CK tactics**:
 
 | Tactic | Focus |
 |---|---|
@@ -136,6 +142,8 @@ Output is written to the output directory as `ZavetSec-EVTXHunter_<timestamp>.ht
 
 Detection logic is tuned to suppress the highest-volume real-world false positives — Windows-managed driver installs, and machine/service accounts authenticating around the clock — without blunting the categories that matter. See [False-positive control](#false-positive-control) for how this is balanced against the BYOVD attack surface.
 
+> When pointed at a directory, EVTXHunter only parses `.evtx` files belonging to channels the rules cover (the ~100 diagnostic/telemetry channels in `winevt\Logs` are skipped so they don't waste time). Pass `-AllFiles` to parse everything regardless of channel.
+
 ### Example detections
 
 A representative sample of the built-in rules (exact titles as they appear in the report):
@@ -143,12 +151,12 @@ A representative sample of the built-in rules (exact titles as they appear in th
 | Tactic | Detection |
 |---|---|
 | Credential Access | Kerberoasting (RC4 service-ticket requests), AS-REP Roasting, DCSync (Directory Replication access), Pass-the-Hash (network NTLM logon), Password Spray |
-| Defense Evasion | Security/System event log cleared, `wevtutil` log clearing, AMSI bypass, Windows Defender tampering |
-| Execution | PowerShell encoded command, download cradle, LOLBin execution, Office spawning a shell |
-| Persistence | New service installed, WMI event subscription, suspicious scheduled task (temp/shell path) |
+| Defense Evasion | Security/System event log cleared, `wevtutil` log clearing, AMSI bypass, Defender tampering, Defender real-time protection disabled, scheduled task deleted |
+| Execution | PowerShell encoded command, download cradle, LOLBin execution, Office spawning a shell, Defender malware detection |
+| Persistence | New service installed, WMI event subscription (Sysmon + native WMI-Activity), scheduled task created/registered, run keys |
 | Privilege Escalation | User added to Administrators / Domain Admins, SID-History injection, token-privilege manipulation |
 | Credential Dumping | LSASS memory access, LSASS dump via `comsvcs.dll` MiniDump, SAM database access |
-| Lateral Movement | RDP brute force, remote thread injection, executable written to an admin share |
+| Lateral Movement | RDP brute force, RDP session/auth tracking (TerminalServices), remote thread injection, executable written to an admin share |
 | Impact | Inhibit system recovery (shadow-copy / backup deletion) |
 
 And multi-event **correlation chains** that single-event rules miss:
@@ -242,7 +250,7 @@ _Benchmarks pending — will be published from a representative dataset on a sta
    └──────────┘
         │
         ▼
-   ┌────────────────────┐   54 Sigma-subset rules + whitelist
+   ┌────────────────────┐   61 Sigma-subset rules + whitelist
    │  Detection engine  │
    └────────────────────┘
         │
@@ -261,7 +269,7 @@ _Benchmarks pending — will be published from a representative dataset on a sta
 ```
 
 1. **Parse** — reads `.evtx` (file mode) or live channels (live mode), normalizing each event's fields into a queryable structure and indexing by Event ID and account.
-2. **Detect** — runs the 54-rule engine over the indexed events, applying the whitelist to suppress known-good noise.
+2. **Detect** — runs the 61-rule engine over the indexed events, applying the whitelist to suppress known-good noise.
 3. **Correlate** — the chain engine looks for multi-event attack sequences within time windows.
 4. **Score** — every finding feeds a per-entity risk score for users, IPs, hosts, and processes; temporal anomalies add weighted context.
 5. **Report** — emits a self-contained interactive HTML report (and optional JSON/CSV) ready to read or hand off. Event timestamps in the report are shown in **UTC** (the EVTX native time base), so findings line up across hosts in different time zones.
