@@ -38,12 +38,7 @@ The entire output is a single self-contained HTML file — no server, no interne
      Suggested captures: full overview, MITRE matrix, top-risk entities, a correlation chain expanded. -->
 <div align="center">
 
-<img src="docs/report-overview.png" width="100%" alt="Findings dashboard ranked by severity">
-
-<br><br>
-
-<img src="docs/report-mitre.png" width="49%" alt="MITRE ATT&CK tactic matrix">
-<img src="docs/report-entities.png" width="49%" alt="Top-risk entity scoring board">
+<img width="1738" height="868" alt="evtxhunter" src="https://github.com/user-attachments/assets/2b1dfa6d-5c5f-455a-ad27-c6ccf2284002" />
 
 </div>
 
