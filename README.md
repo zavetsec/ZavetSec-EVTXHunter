@@ -22,7 +22,11 @@ Point it at a folder of `.evtx` files — or run it live on the host. Minutes la
 
 It is built for the analyst working an incident under time pressure, on an isolated host, who needs answers from the logs *now* — not after standing up a pipeline.
 
+Most EVTX hunters answer one question: *which events matched a rule?* EVTXHunter is built to answer the questions that come next — *which user is most suspicious, which host accumulated the most risk, which events form a complete attack chain, and what should be investigated first.* The correlation engine, per-entity risk scoring, and hand-off-ready HTML report exist to turn a wall of matches into a triaged investigation. The point is not just detection — it is triage.
+
 > **EVTXHunter trades breadth for zero-friction deployment plus the analysis the others leave to you** — correlation, scoring, and a report you can hand to someone without a SIEM.
+
+*Bring the analysis to the logs, not the logs to the platform.*
 
 ---
 
@@ -34,7 +38,12 @@ The entire output is a single self-contained HTML file — no server, no interne
      Suggested captures: full overview, MITRE matrix, top-risk entities, a correlation chain expanded. -->
 <div align="center">
 
-<img width="1738" height="868" alt="evtxhunter" src="https://github.com/user-attachments/assets/2b1dfa6d-5c5f-455a-ad27-c6ccf2284002" />
+<img src="docs/report-overview.png" width="100%" alt="Findings dashboard ranked by severity">
+
+<br><br>
+
+<img src="docs/report-mitre.png" width="49%" alt="MITRE ATT&CK tactic matrix">
+<img src="docs/report-entities.png" width="49%" alt="Top-risk entity scoring board">
 
 </div>
 
@@ -131,6 +140,32 @@ Output is written to the output directory as `ZavetSec-EVTXHunter_<timestamp>.ht
 | Command and Control | Suspicious outbound indicators |
 
 Detection logic is tuned to suppress the highest-volume real-world false positives — Windows-managed driver installs, and machine/service accounts authenticating around the clock — without blunting the categories that matter. See [False-positive control](#false-positive-control) for how this is balanced against the BYOVD attack surface.
+
+### Example detections
+
+A representative sample of the built-in rules (exact titles as they appear in the report):
+
+| Tactic | Detection |
+|---|---|
+| Credential Access | Kerberoasting (RC4 service-ticket requests), AS-REP Roasting, DCSync (Directory Replication access), Pass-the-Hash (network NTLM logon), Password Spray |
+| Defense Evasion | Security/System event log cleared, `wevtutil` log clearing, AMSI bypass, Windows Defender tampering |
+| Execution | PowerShell encoded command, download cradle, LOLBin execution, Office spawning a shell |
+| Persistence | New service installed, WMI event subscription, suspicious scheduled task (temp/shell path) |
+| Privilege Escalation | User added to Administrators / Domain Admins, SID-History injection, token-privilege manipulation |
+| Credential Dumping | LSASS memory access, LSASS dump via `comsvcs.dll` MiniDump, SAM database access |
+| Lateral Movement | RDP brute force, remote thread injection, executable written to an admin share |
+| Impact | Inhibit system recovery (shadow-copy / backup deletion) |
+
+And multi-event **correlation chains** that single-event rules miss:
+
+- Brute Force Leading to Successful Logon
+- Reconnaissance Followed by Lateral Movement
+- Persistence via Service Followed by Log Clearing
+- Account Creation Followed by Admin Group Addition
+- DCSync Preparation: Recon then Replication Access
+- PowerShell Encoded Execution Followed by Persistence
+
+
 
 ---
 

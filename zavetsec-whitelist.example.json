@@ -1,6 +1,7 @@
 [
-  { "RuleID": "ZVS-PE-001", "Fields": { "ImagePath": "*\\DRIVERS\\K4W-*\\*.sys" } },
-  { "RuleID": "ZVS-PE-001", "Fields": { "ImagePath": "*klelam.sys*" } },
-  { "RuleID": "ZVS-PE-001", "Fields": { "ImagePath": "*klim6.sys*" } },
-  { "RuleID": "ZVS-PE-001", "Fields": { "ServiceName": "Kaspersky*" } }
+  { "RuleID": "ZVS-PE-001",  "Fields": { "ImagePath": "*\\DRIVERS\\K4W-*\\*.sys" } },
+  { "RuleID": "ZVS-PE-001",  "Fields": { "ServiceName": "Kaspersky*" } },
+  { "RuleID": "ZVS-PE-001",  "Fields": { "ServiceName": "klflt*" } },
+  { "RuleID": "ZVS-PE-002b", "Fields": { "ImagePath": "*\\Kaspersky Lab\\*" } },
+  { "RuleID": "ZVS-PE-001",  "Fields": { "ImagePath": "*\\YourManagementAgent\\*.exe" } }
 ]
