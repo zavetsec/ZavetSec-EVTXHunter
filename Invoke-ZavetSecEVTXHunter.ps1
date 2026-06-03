@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    ZavetSec-EVTXHunter v1.1.0 - Advanced Windows Event Log Threat Hunter
+    ZavetSec-EVTXHunter v1.2.0 - Advanced Windows Event Log Threat Hunter
 
 .DESCRIPTION
     Threat hunting and DFIR analysis tool for Windows Event Logs (EVTX).
@@ -57,6 +57,12 @@
     local is evaluated correctly regardless of the analyst workstation's
     own time zone. Display timestamps elsewhere are unaffected.
 
+.PARAMETER DormantDays
+    Number of days of inactivity after which an account is considered dormant.
+    A subsequent authentication by that account (a "wakeup") is flagged as a
+    temporal anomaly. Detected within the analyzed dataset by gap analysis of
+    each account's authentication timeline. Default: 30. Set 0 to disable.
+
 .PARAMETER Whitelist
     Path to JSON whitelist file with conditions to suppress false positives.
     Expected shape (array of objects):
@@ -82,7 +88,7 @@
 
 .NOTES
     Author  : ZavetSec Research
-    Version : 1.1.0
+    Version : 1.2.0
     Tags    : DFIR, Threat Hunting, EVTX, Sigma, Windows Event Logs
     License : MIT
 #>
@@ -124,6 +130,9 @@ param(
     [int]$WorkHoursTimeZoneOffset = 0,
 
     [ValidateRange(0,[int]::MaxValue)]
+    [int]$DormantDays = 30,
+
+    [ValidateRange(0,[int]::MaxValue)]
     [int]$MaxEvents = 1000000,
 
     [ValidateRange(0,[int]::MaxValue)]
@@ -147,7 +156,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 # SECTION 1: CONSTANTS & GLOBAL STATE
 # ================================================================
 
-$script:VERSION        = '1.0.0'
+$script:VERSION        = '1.2.0'
 $script:TOOL_NAME      = 'ZavetSec-EVTXHunter'
 $script:StartTime      = Get-Date
 $script:TotalParsed    = 0
@@ -2693,6 +2702,38 @@ function Invoke-TemporalAnalysis {
                 -Severity 'Medium' -Multiplier ([decimal]1.5) `
                 -Reason "Burst activity: $maxBurst events in 60 seconds"
             $anomalies++
+        }
+    }
+
+    # 3. Dormant-account wakeup: an account inactive for >= DormantDays that
+    # suddenly authenticates again. Detected within the dataset by gap analysis
+    # of each account's auth timeline (4624/4625/4648). A long dormancy followed
+    # by a logon is a classic indicator of a reactivated stale/backdoor account.
+    if ($DormantDays -gt 0) {
+        $authEventIDs = @(4624, 4625, 4648)
+        foreach ($user in $script:IdxByUser.Keys) {
+            if (Test-IsMachineOrServiceAccount $user) { continue }
+
+            # Restrict to authentication events for this user, in time order.
+            $authTimes = @(
+                $script:IdxByUser[$user] |
+                    Where-Object { $_.EventID -in $authEventIDs } |
+                    Sort-Object TimeCreated
+            )
+            if ($authTimes.Count -lt 2) { continue }
+
+            for ($i = 1; $i -lt $authTimes.Count; $i++) {
+                $gapDays = ($authTimes[$i].TimeCreated - $authTimes[$i-1].TimeCreated).TotalDays
+                if ($gapDays -ge $DormantDays) {
+                    $wake = $authTimes[$i]
+                    Add-EntityScore -EntityType 'User' -EntityKey $user `
+                        -Severity 'Medium' -Multiplier ([decimal]1.6) `
+                        -Reason ("Dormant-account wakeup: {0:N0} days inactive, then auth ({1}) at {2} UTC" -f `
+                            [Math]::Floor($gapDays), $wake.EventID, $wake.TimeCreated.ToUniversalTime().ToString('yyyy-MM-dd HH:mm'))
+                    $anomalies++
+                    break   # one wakeup per account is enough signal
+                }
+            }
         }
     }
 
