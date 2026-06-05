@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    ZavetSec-EVTXHunter v1.3.0 - Advanced Windows Event Log Threat Hunter
+    ZavetSec-EVTXHunter v1.3.4 - Advanced Windows Event Log Threat Hunter
 
 .DESCRIPTION
     Threat hunting and DFIR analysis tool for Windows Event Logs (EVTX).
@@ -99,7 +99,7 @@
 
 .NOTES
     Author  : ZavetSec Research
-    Version : 1.3.0
+    Version : 1.3.4
     Tags    : DFIR, Threat Hunting, EVTX, Sigma, Windows Event Logs
     License : MIT
 #>
@@ -175,7 +175,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 # SECTION 1: CONSTANTS & GLOBAL STATE
 # ================================================================
 
-$script:VERSION        = '1.3.0'
+$script:VERSION        = '1.3.4'
 $script:TOOL_NAME      = 'ZavetSec-EVTXHunter'
 $script:StartTime      = Get-Date
 $script:TotalParsed    = 0
@@ -1940,7 +1940,7 @@ $script:DetectionRules = @(
     }
 
     [PSCustomObject]@{
-        RuleID           = 'ZVS-LM-003'
+        RuleID           = 'ZVS-LM-006'
         Title            = 'RDP Session Logon (TerminalServices)'
         Description      = 'An interactive RDP session was established or reconnected, observed on TerminalServices-LocalSessionManager/Operational (EID 21/25), including the source network address. Context for lateral-movement correlation; fires on every RDP session.'
         EventIDs         = @(21, 25)
@@ -1956,7 +1956,7 @@ $script:DetectionRules = @(
     }
 
     [PSCustomObject]@{
-        RuleID           = 'ZVS-LM-004'
+        RuleID           = 'ZVS-LM-007'
         Title            = 'RDP Authentication Succeeded (RemoteConnectionManager)'
         Description      = 'A remote desktop authentication succeeded, observed on TerminalServices-RemoteConnectionManager/Operational (EID 1149). Records the connecting user and source IP (Param fields) even when Security auditing is sparse.'
         EventIDs         = @(1149)
@@ -2530,6 +2530,7 @@ function Add-Finding {
         Description      = $Rule.Description
         Recommendation   = $Rule.Recommendation
         EventRecordID    = $Event.EventRecordID
+        RawFields        = $Event.RawFields   # representative event's raw data, for the detail modal
     }
 
     # Trim CommandLine/ScriptBlock for display (keep full for details)
@@ -3065,9 +3066,62 @@ function ConvertTo-FindingsJson {
         $tech    = ConvertTo-JsonString (ConvertTo-HtmlEncoded $f.MitreTechniqueID)
         $chain   = if ($f.IsChain) { 'true' } else { 'false' }
 
+        # Build a "data" object from the event's raw fields so events whose
+        # meaningful content is NOT in the normalized fields (Defender, WMI-Activity,
+        # TaskScheduler, TerminalServices, etc.) still show real detail in the modal.
+        # Skip fields already surfaced as dedicated rows, aliases, and noise.
+        $skipFields = @(
+            'SubjectUserName','TargetUserName','IpAddress','SourceNetworkAddress',
+            'ClientAddress','NewProcessName','ProcessName','Image','ImagePath',
+            'CommandLine','ScriptBlockText','ServiceName','TaskName','Channel','ProviderName'
+        )
+        # High-value field name fragments surfaced FIRST so they survive the cap
+        # regardless of the order the provider emits them in (e.g. Defender 1116
+        # lists ~30 fields with Path/Threat Name near the end).
+        $priorityFields = @(
+            'Threat Name','Path','Process Name','Detection User','Severity Name',
+            'Action Name','Category Name','CONSUMER','Namespace','ESS','PossibleCause',
+            'UserContext','UserName','TargetFilename','TargetImage','SourceImage',
+            'DestinationIp','DestinationHostname','QueryName','User','AccountName',
+            'Workstation','LogonType','Status','Param1','Param3','Address'
+        )
+        $rankOf = {
+            param($key)
+            for ($pi = 0; $pi -lt $priorityFields.Count; $pi++) {
+                if ($key -ieq $priorityFields[$pi] -or $key -ilike "*$($priorityFields[$pi])*") { return $pi }
+            }
+            return 1000
+        }
+        $dataPairs = [System.Collections.Generic.List[string]]::new()
+        if ($f.RawFields -is [System.Collections.IDictionary]) {
+            $idx = 0
+            $candidates = foreach ($k in $f.RawFields.Keys) {
+                $idx++
+                if ($skipFields -contains $k) { continue }
+                if ([string]::IsNullOrWhiteSpace([string]$k) -or $k -like '_Data*') { continue }
+                $val = [string]$f.RawFields[$k]
+                if ([string]::IsNullOrWhiteSpace($val)) { continue }
+                [PSCustomObject]@{ K = [string]$k; V = $val; Rank = (& $rankOf ([string]$k)); Idx = $idx }
+            }
+            # Sort-Object is not stable on PS 5.1 - Idx is the tiebreaker so non-priority
+            # fields keep the event's original order.
+            $ordered = $candidates | Sort-Object Rank, Idx
+            $shown = 0
+            foreach ($c in $ordered) {
+                if ($shown -ge 24) { break }
+                $val = $c.V
+                if ($val.Length -gt 400) { $val = $val.Substring(0,400) + '...' }
+                $ek = ConvertTo-JsonString (ConvertTo-HtmlEncoded $c.K)
+                $ev = ConvertTo-JsonString (ConvertTo-HtmlEncoded $val)
+                $dataPairs.Add("`"$ek`":`"$ev`"")
+                $shown++
+            }
+        }
+        $dataJson = '{' + ($dataPairs -join ',') + '}'
+
         $ts      = $f.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
 
-        "{`"id`":`"$($f.FindingID)`",`"ts`":`"$ts`",`"sev`":`"$($f.Severity)`",`"title`":`"$title`",`"rule`":`"$($f.RuleID)`",`"computer`":`"$comp`",`"eid`":$($f.EventID),`"tactic`":`"$tactic`",`"technique`":`"$tech`",`"subj`":`"$subj`",`"tgt`":`"$tgt`",`"ip`":`"$ip`",`"proc`":`"$proc`",`"cmd`":`"$cmdl`",`"svc`":`"$svc`",`"task`":`"$task`",`"cnt`":$($f.GroupCount),`"chain`":$chain,`"desc`":`"$desc`",`"rec`":`"$rec`"}"
+        "{`"id`":`"$($f.FindingID)`",`"ts`":`"$ts`",`"sev`":`"$($f.Severity)`",`"title`":`"$title`",`"rule`":`"$($f.RuleID)`",`"computer`":`"$comp`",`"eid`":$($f.EventID),`"tactic`":`"$tactic`",`"technique`":`"$tech`",`"subj`":`"$subj`",`"tgt`":`"$tgt`",`"ip`":`"$ip`",`"proc`":`"$proc`",`"cmd`":`"$cmdl`",`"svc`":`"$svc`",`"task`":`"$task`",`"cnt`":$($f.GroupCount),`"chain`":$chain,`"data`":$dataJson,`"desc`":`"$desc`",`"rec`":`"$rec`"}"
     }
     '[' + ($arr -join ',') + ']'
 }
@@ -3565,7 +3619,21 @@ function openFinding(id) {
   if (!f) return;
   const sc = SEVCOLOR[f.sev]||'#6b7280';
   const chainBadge = f.chain ? '<span class="badge badge-chain" style="margin-left:8px">CORRELATION CHAIN</span>' : '';
-  const cmdBlock = f.cmd ? `<div class="modal-row"><span class="modal-key">Command</span><div class="modal-val cmd">${f.cmd}</div></div>` : '';
+  const cmdBlock = (f.cmd && f.cmd !== '-') ? `<div class="modal-row"><span class="modal-key">Command</span><div class="modal-val cmd">${f.cmd}</div></div>` : '';
+
+  // Only render a normalized row when it actually has a value (avoids a wall of
+  // dashes for events like Defender/WMI whose data lives in non-standard fields).
+  const row = (k, v) => (v && v !== '-') ? `<div class="modal-row"><span class="modal-key">${k}</span><span class="modal-val">${v}</span></div>` : '';
+
+  // Event Data: raw fields straight from the event, for any type the normalized
+  // rows don't cover.
+  let dataRows = '';
+  if (f.data && Object.keys(f.data).length) {
+    dataRows = '<div class="modal-rec-label" style="margin-top:14px;margin-bottom:6px">Event Data</div>' +
+      Object.keys(f.data).map(k =>
+        `<div class="modal-row"><span class="modal-key">${k}</span><span class="modal-val">${f.data[k]}</span></div>`
+      ).join('');
+  }
 
   document.getElementById('modal-inner').innerHTML = `
     <div style="margin-bottom:6px"><span class="badge" style="background:${sc}22;color:${sc};border:1px solid ${sc}44">${f.sev}</span>${chainBadge}</div>
@@ -3575,14 +3643,15 @@ function openFinding(id) {
     <div class="modal-row"><span class="modal-key">Time (UTC)</span><span class="modal-val">${f.ts}</span></div>
     <div class="modal-row"><span class="modal-key">Computer</span><span class="modal-val">${f.computer||'-'}</span></div>
     <div class="modal-row"><span class="modal-key">Event ID</span><span class="modal-val">${f.eid}</span></div>
-    <div class="modal-row"><span class="modal-key">Subject User</span><span class="modal-val">${f.subj||'-'}</span></div>
-    <div class="modal-row"><span class="modal-key">Target User</span><span class="modal-val">${f.tgt||'-'}</span></div>
-    <div class="modal-row"><span class="modal-key">Source IP</span><span class="modal-val">${f.ip||'-'}</span></div>
-    <div class="modal-row"><span class="modal-key">Process</span><span class="modal-val">${f.proc||'-'}</span></div>
-    <div class="modal-row"><span class="modal-key">Service</span><span class="modal-val">${f.svc||'-'}</span></div>
-    <div class="modal-row"><span class="modal-key">Task</span><span class="modal-val">${f.task||'-'}</span></div>
+    ${row('Subject User', f.subj)}
+    ${row('Target User', f.tgt)}
+    ${row('Source IP', f.ip)}
+    ${row('Process', f.proc)}
+    ${row('Service', f.svc)}
+    ${row('Task', f.task)}
     ${cmdBlock}
-    <div class="modal-row"><span class="modal-key">MITRE Tactic</span><span class="modal-val">${f.tactic||'-'}</span></div>
+    ${dataRows}
+    <div class="modal-row" style="margin-top:14px"><span class="modal-key">MITRE Tactic</span><span class="modal-val">${f.tactic||'-'}</span></div>
     <div class="modal-row"><span class="modal-key">Technique</span><span class="modal-val">${f.technique||'-'}</span></div>
     <div class="modal-rec"><div class="modal-rec-label">Recommendation</div>${f.rec}</div>
   `;

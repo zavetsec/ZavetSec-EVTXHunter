@@ -5,6 +5,44 @@ All notable changes to ZavetSec-EVTXHunter are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.4]
+
+### Fixed
+- Finding detail modal no longer shows an empty **Command** row (a dash) for
+  events with no command line; it is now hidden like the other empty normalized
+  rows. (Sparse Event Data for events such as Defender 5001 is expected - that
+  event only carries product name/version.)
+
+## [1.3.3]
+
+### Changed
+- **Event Data now prioritizes high-value fields.** For events with many fields
+  (e.g. Defender 1116 emits ~30, listing Path / Threat Name / Process Name near
+  the end), forensically important fields are surfaced first so they survive the
+  per-finding field cap, which was raised from 20 to 24. Non-priority fields keep
+  the event's original order.
+
+## [1.3.2]
+
+### Fixed
+- **Finding detail showed only dashes for non-Security/Sysmon events.** The modal
+  rendered a fixed set of normalized fields (Subject User, Process, Service, etc.)
+  that are empty for events whose data lives elsewhere - Defender (5001/1116),
+  WMI-Activity, TaskScheduler, TerminalServices. The finding now carries the
+  representative event's raw fields and the modal shows them under a new
+  **Event Data** section; empty normalized rows are hidden instead of shown as
+  dashes. The JSON export likewise now includes per-finding raw event fields.
+
+## [1.3.1]
+
+### Fixed
+- **Duplicate RuleID collision in 1.3.0.** The two new RDP rules were assigned
+  `ZVS-LM-003` / `ZVS-LM-004`, which already existed (Explicit Credential Logon /
+  Remote Thread Injection). The collision conflated those rules' findings and
+  entity attribution in the report. The RDP rules are renumbered to `ZVS-LM-006`
+  (RDP Session Logon) and `ZVS-LM-007` (RDP Authentication Succeeded); rule count
+  is unchanged (61). Re-run any 1.3.0 scan for correct attribution.
+
 ## [1.3.0]
 
 ### Added
@@ -102,6 +140,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Self-contained interactive HTML report, plus optional JSON / CSV output.
 - Built-in vendor whitelist and external JSON whitelist support.
 
+[1.3.4]: https://github.com/zavetsec/ZavetSec-EVTXHunter/releases/tag/v1.3.4
+[1.3.3]: https://github.com/zavetsec/ZavetSec-EVTXHunter/releases/tag/v1.3.3
+[1.3.2]: https://github.com/zavetsec/ZavetSec-EVTXHunter/releases/tag/v1.3.2
+[1.3.1]: https://github.com/zavetsec/ZavetSec-EVTXHunter/releases/tag/v1.3.1
 [1.3.0]: https://github.com/zavetsec/ZavetSec-EVTXHunter/releases/tag/v1.3.0
 [1.2.3]: https://github.com/zavetsec/ZavetSec-EVTXHunter/releases/tag/v1.2.3
 [1.2.2]: https://github.com/zavetsec/ZavetSec-EVTXHunter/releases/tag/v1.2.2
